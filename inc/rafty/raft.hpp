@@ -50,7 +50,7 @@ public:
                                         uint64_t last_log_term);
 
   AppendEntriesResult handle_append_entries(const raftpb::AppendEntriesRequest &req);
-
+  void send_heartbeats();
   // lab3: sync propose
   ProposalResult propose_sync(const std::string &data);
 
@@ -88,6 +88,9 @@ private:
   std::unordered_map<uint64_t, RaftServiceStub> peers_;
   std::unique_ptr<Server> server_;
   std::unique_ptr<rafty::RaftServiceImpl> service_impl_;
+
+  std::chrono::steady_clock::time_point next_heartbeat_deadline;
+  std::chrono::steady_clock::time_point election_deadline;
 
   // current term known to this server
   uint64_t current_term = 0;

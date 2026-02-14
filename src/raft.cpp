@@ -17,16 +17,102 @@ Raft::Raft(const Config &config, MessageQueue<ApplyResult> &ready)
       listening_addr(config.addr),
       peer_addrs(config.peer_addrs),
       dead(false),
-      ready_queue(ready) {
+      ready_queue(ready),
+      current_term(0),    // move these up
+      voted_for(-1),
+      is_leader_(false) {
 }
 
 Raft::~Raft() { this->stop_server(); }
+
+
+void Raft::send_heartbeats() {
+    // Note: Caller (run loop) already holds the lock, but since we 
+    // are spawning threads, we capture the data we need.
+    for (auto &peer : this->peers_) {
+        uint64_t peer_id = peer.first;
+        
+        raftpb::AppendEntriesRequest req;
+        req.set_term(this->current_term);
+        req.set_leader_id(this->id);
+
+        // Spawn a thread for each peer so one slow connection doesn't block the leader
+        std::thread([this, peer_id, req]() {
+            auto context = this->create_context(peer_id);
+            raftpb::AppendEntriesResponse res;
+            
+            auto status = this->peers_[peer_id]->AppendEntries(context.get(), req, &res);
+
+            if (status.ok()) {
+                std::unique_lock<std::mutex> lock(this->mtx);
+                // Rule: If response contains term T > currentTerm, step down
+                if (res.term() > this->current_term) {
+                    this->current_term = res.term();
+                    this->is_leader_ = false;
+                    this->voted_for = -1;
+                }
+            }
+        }).detach();
+    }
+}
 
 void Raft::run() {
   // TODO: kick off the raft instance
   // Note: this function should be non-blocking
 
   // lab 1
+
+  // 1. Initialize random seed based on node ID
+  std::srand(static_cast<unsigned int>(this->id) + std::time(nullptr));
+
+  // 2. Spawn a background thread so run() is non-blocking
+  std::thread([this]() {
+    this->logger->info("Raft node {} background loop started", id);
+
+    auto now = std::chrono::steady_clock::now();
+    
+    // Initial deadlines
+    {
+        std::scoped_lock lock(this->mtx);
+        this->next_heartbeat_deadline = now;
+        // Random timeout between 150ms and 300ms
+        this->election_deadline = now + std::chrono::milliseconds(150 + (std::rand() % 150));
+    }
+
+    while (!this->is_dead()) {
+      now = std::chrono::steady_clock::now();
+      std::unique_lock<std::mutex> lock(this->mtx);
+
+      if (this->is_leader_) {
+        // LEADER: Send heartbeats every 100ms
+        if (now >= this->next_heartbeat_deadline) {
+          this->send_heartbeats(); 
+          this->next_heartbeat_deadline = now + std::chrono::milliseconds(100);
+        }
+      } else {
+        // FOLLOWER/CANDIDATE: Check if leader has been silent too long
+        if (now >= this->election_deadline) {
+          this->logger->info("Node {} timeout! Starting election", id);
+          
+          this->is_leader_ = false;
+          this->current_term++;
+          this->voted_for = this->id;
+
+          // Reset election timer for the campaign period
+          this->election_deadline = now + std::chrono::milliseconds(150 + (std::rand() % 150));
+          
+          // Start the voting process (Part C)
+          // this->send_request_votes(); 
+        }
+      }
+      lock.unlock();
+
+      // Sleep a bit to prevent 100% CPU usage
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    
+    this->logger->info("Raft node {} background loop exiting", id);
+  }).detach(); // Detach allows the thread to run independently
 }
 
 State Raft::get_state() const {
@@ -98,6 +184,9 @@ ProposalResult Raft::propose_sync(const std::string &data) {
       this->voted_for = -1;
       this->is_leader_ = false;
     }
+
+    auto now = std::chrono::steady_clock::now();
+    this->election_deadline = now + std::chrono::milliseconds(150 + (std::rand() % 150));
 
     result.term = this->current_term;
     result.success = true;
