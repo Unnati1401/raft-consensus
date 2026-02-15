@@ -51,6 +51,7 @@ public:
 
   AppendEntriesResult handle_append_entries(const raftpb::AppendEntriesRequest &req);
   void send_heartbeats();
+  void send_request_votes();
   // lab3: sync propose
   ProposalResult propose_sync(const std::string &data);
 

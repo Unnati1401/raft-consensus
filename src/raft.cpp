@@ -56,6 +56,55 @@ void Raft::send_heartbeats() {
     }
 }
 
+void Raft::send_request_votes() {
+    // Shared state for the threads to update
+    auto votes_received = std::make_shared<std::atomic<int>>(1); // 1 for self
+    int total_nodes = this->peers_.size() + 1;
+    int majority = total_nodes / 2 + 1;
+    uint64_t election_term = this->current_term;
+
+    for (auto const& [peer_id, stub] : this->peers_) {
+        std::thread([this, peer_id, election_term, votes_received, majority]() {
+            raftpb::RequestVoteRequest req;
+            req.set_term(election_term);
+            req.set_candidate_id(this->id);
+            // Lab 1 placeholders
+            req.set_last_log_index(0); 
+            req.set_last_log_term(0);
+
+            auto context = this->create_context(peer_id);
+            raftpb::RequestVoteResponse res;
+            auto status = this->peers_[peer_id]->RequestVote(context.get(), req, &res);
+
+            if (status.ok()) {
+                std::unique_lock<std::mutex> lock(this->mtx);
+                
+                // 1. Term Check: If we see a higher term, we lose and step down
+                if (res.term() > this->current_term) {
+                    this->current_term = res.term();
+                    this->is_leader_ = false;
+                    this->voted_for = -1;
+                    return;
+                }
+
+                // 2. Term Validation: Ensure we are still in the same election
+                if (this->current_term != election_term || this->is_leader_) return;
+
+                // 3. Count Vote
+                if (res.vote_granted()) {
+                    if (++(*votes_received) >= majority) {
+                        this->is_leader_ = true;
+                        this->logger->info("Node {} became leader for term {}", id, current_term);
+                        this->next_heartbeat_deadline = std::chrono::steady_clock::now();
+                        // Leader should send heartbeats immediately to stop others from timing out
+                        this->send_heartbeats(); 
+                    }
+                }
+            }
+        }).detach();
+    }
+}
+
 void Raft::run() {
   // TODO: kick off the raft instance
   // Note: this function should be non-blocking
@@ -102,7 +151,7 @@ void Raft::run() {
           this->election_deadline = now + std::chrono::milliseconds(150 + (std::rand() % 150));
           
           // Start the voting process (Part C)
-          // this->send_request_votes(); 
+          this->send_request_votes(); 
         }
       }
       lock.unlock();
@@ -117,6 +166,7 @@ void Raft::run() {
 
 State Raft::get_state() const {
   // TODO: lab 1
+  std::scoped_lock lock(this->mtx);
   State s;
   s.term = this->current_term;
   s.is_leader = this->is_leader_;
@@ -159,6 +209,8 @@ ProposalResult Raft::propose_sync(const std::string &data) {
         this->voted_for == static_cast<int64_t>(candidate_id)) {
       this->voted_for = static_cast<int64_t>(candidate_id);
       result.vote_granted = true;
+      auto now = std::chrono::steady_clock::now();
+      this->election_deadline = now + std::chrono::milliseconds(150 + (std::rand() % 150));
     }
 
     result.term = this->current_term;
