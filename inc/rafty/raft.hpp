@@ -14,9 +14,8 @@
 #include "common/logger.hpp"
 #include "toolings/msg_queue.hpp"
 
-// it will pick up correct header
-// when you generate the grpc proto files
 #include "raft.grpc.pb.h"
+#include "rafty/raft_service_impl.hpp"
 
 using namespace toolings;
 
@@ -34,7 +33,25 @@ public:
   void run(); /* lab 1 */
   ProposalResult propose(const std::string &data); /* lab 1 */
   State get_state() const; /* lab 2 */
+  // RPC result helpers and handlers (declared for definition in src/raft.cpp)
+  struct RequestVoteResult {
+    uint64_t term;
+    bool vote_granted;
+  };
 
+  struct AppendEntriesResult {
+    uint64_t term;
+    bool success;
+  };
+
+  RequestVoteResult handle_request_vote(uint64_t term,
+                                        uint64_t candidate_id,
+                                        uint64_t last_log_index,
+                                        uint64_t last_log_term);
+
+  AppendEntriesResult handle_append_entries(const raftpb::AppendEntriesRequest &req);
+  void send_heartbeats();
+  void send_request_votes();
   // lab3: sync propose
   ProposalResult propose_sync(const std::string &data);
 
@@ -71,6 +88,17 @@ private:
 
   std::unordered_map<uint64_t, RaftServiceStub> peers_;
   std::unique_ptr<Server> server_;
+  std::unique_ptr<rafty::RaftServiceImpl> service_impl_;
+
+  std::chrono::steady_clock::time_point next_heartbeat_deadline;
+  std::chrono::steady_clock::time_point election_deadline;
+
+  // current term known to this server
+  uint64_t current_term = 0;
+  // candidate ID that received vote in current_term (or -1 for none)
+  int64_t voted_for = -1;
+  // whether this node currently considers itself leader
+  bool is_leader_ = false;
 };
 } // namespace rafty
 
