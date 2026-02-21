@@ -47,10 +47,13 @@ void Raft::send_heartbeats() {
                 std::unique_lock<std::mutex> lock(this->mtx);
                 // Rule: If response contains term T > currentTerm, step down
                 if (res.term() > this->current_term) {
-                    this->current_term = res.term();
-                    this->is_leader_ = false;
-                    this->voted_for = -1;
-                }
+                  this->current_term = res.term();
+                  this->is_leader_ = false;
+                  this->voted_for = -1;
+                  this->election_deadline =
+                      std::chrono::steady_clock::now() +
+                      std::chrono::milliseconds(150 + (std::rand() % 150));
+              }
             }
         }).detach();
     }
@@ -75,35 +78,50 @@ void Raft::send_request_votes() {
             auto context = this->create_context(peer_id);
             raftpb::RequestVoteResponse res;
             auto status = this->peers_[peer_id]->RequestVote(context.get(), req, &res);
+            if (!status.ok()) {
+                return;
+            }
 
-            if (status.ok()) {
-                std::unique_lock<std::mutex> lock(this->mtx);
-                
-                // 1. Term Check: If we see a higher term, we lose and step down
-                if (res.term() > this->current_term) {
-                    this->current_term = res.term();
-                    this->is_leader_ = false;
-                    this->voted_for = -1;
-                    return;
-                }
+            std::unique_lock<std::mutex> lock(this->mtx);
 
-                // 2. Term Validation: Ensure we are still in the same election
-                if (this->current_term != election_term || this->is_leader_) return;
+            // If we see a higher term → step down immediately
+            if (res.term() > this->current_term) {
+                this->current_term = res.term();
+                this->is_leader_ = false;
+                this->voted_for = -1;
+                this->election_deadline =
+                    std::chrono::steady_clock::now() +
+                    std::chrono::milliseconds(150 + (std::rand() % 150));
+                return;
+            }
 
-                // 3. Count Vote
-                if (res.vote_granted()) {
-                    if (++(*votes_received) >= majority) {
-                        this->is_leader_ = true;
-                        this->logger->info("Node {} became leader for term {}", id, current_term);
-                        this->next_heartbeat_deadline = std::chrono::steady_clock::now();
-                        // Leader should send heartbeats immediately to stop others from timing out
-                        this->send_heartbeats(); 
-                    }
+            // Ignore stale replies
+            if (res.term() != election_term) {
+                return;
+            }
+
+            // Ignore if we are no longer candidate
+            if (this->is_leader_) {
+                return;
+            }
+
+            if (this->current_term != election_term) {
+                return;
+            }
+
+            // Count vote
+            if (res.vote_granted()) {
+                if (++(*votes_received) >= majority) {
+                    this->is_leader_ = true;
+                    this->logger->info("Node {} became leader for term {}", id, current_term);
+                    this->next_heartbeat_deadline = std::chrono::steady_clock::now();
+                    lock.unlock();
+                    this->send_heartbeats();  // send immediately
                 }
             }
-        }).detach();
-    }
-}
+          }).detach();
+      }
+  }
 
 void Raft::run() {
   // TODO: kick off the raft instance
@@ -232,10 +250,11 @@ ProposalResult Raft::propose_sync(const std::string &data) {
     }
 
     if (req.term() > this->current_term) {
-      this->current_term = req.term();
-      this->voted_for = -1;
-      this->is_leader_ = false;
+        this->current_term = req.term();
+        this->voted_for = -1;
     }
+
+    this->is_leader_ = false;
 
     auto now = std::chrono::steady_clock::now();
     this->election_deadline = now + std::chrono::milliseconds(150 + (std::rand() % 150));
