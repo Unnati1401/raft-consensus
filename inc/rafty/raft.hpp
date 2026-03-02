@@ -75,6 +75,20 @@ protected:
   mutable std::mutex mtx;
   std::unique_ptr<rafty::utils::logger> logger;
 
+  // Log storage
+  std::vector<raftpb::Entry> log_;
+  
+  // Volatile state on all servers
+  uint64_t commit_index_;
+  uint64_t last_applied_;
+  
+  // Volatile state on leaders
+  std::unordered_map<uint64_t, uint64_t> next_index_;
+  std::unordered_map<uint64_t, uint64_t> match_index_;
+  
+  void apply_committed_entries();
+  void update_commit_index();
+
 private:
   // WARN: do not modify the declaration of
   // `id`, `listening_addr`, `peer_addrs`,
