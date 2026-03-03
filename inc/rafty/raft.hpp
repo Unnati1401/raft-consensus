@@ -88,7 +88,10 @@ protected:
   
   void apply_committed_entries();
   void update_commit_index();
-
+  std::chrono::steady_clock::time_point next_heartbeat_deadline;
+  std::chrono::steady_clock::time_point election_deadline;
+  void start_election();
+  
 private:
   // WARN: do not modify the declaration of
   // `id`, `listening_addr`, `peer_addrs`,
@@ -103,9 +106,6 @@ private:
   std::unordered_map<uint64_t, RaftServiceStub> peers_;
   std::unique_ptr<Server> server_;
   std::unique_ptr<rafty::RaftServiceImpl> service_impl_;
-
-  std::chrono::steady_clock::time_point next_heartbeat_deadline;
-  std::chrono::steady_clock::time_point election_deadline;
 
   // current term known to this server
   uint64_t current_term = 0;
