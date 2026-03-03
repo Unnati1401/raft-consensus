@@ -67,7 +67,7 @@ void Raft::run() {
                         should_elect = true;
                     }
                 }
-            } // lock released HERE — before any RPC
+            } // lock released HERE - before any RPC
 
             if (should_heartbeat) this->send_heartbeats();
             if (should_elect)     this->start_election();
@@ -145,7 +145,6 @@ void Raft::start_election() {
 
             // 3. Process granted vote
             if (res.vote_granted()) {
-                // CHANGE: Use == so initialization happens exactly once
                 if (++(*votes_received) == majority) {
                     this->is_leader_ = true;
                     this->logger->info("Node {} became leader for term {}",
@@ -167,7 +166,6 @@ void Raft::start_election() {
 }
 
 void Raft::send_heartbeats() {
-    // -------- Phase 1: Build RPC requests under lock --------
     // We snapshot the state needed so we don't hold the lock during network I/O.
     std::vector<std::pair<uint64_t, raftpb::AppendEntriesRequest>> requests;
 
@@ -205,7 +203,7 @@ void Raft::send_heartbeats() {
         }
     }
 
-    // -------- Phase 2: Dispatch RPCs without holding lock --------
+    //  Phase 2: Dispatch RPCs without holding lock 
     for (auto& [peer_id, req] : requests) {
         std::thread([this, peer_id, req]() {
             auto context = this->create_context(peer_id);
@@ -230,7 +228,7 @@ void Raft::send_heartbeats() {
             if (!this->is_leader_ || req.term() != this->current_term) return;
 
             if (res.success()) {
-                // SUCCESS: Update indices only if this reply is more recent than what we know
+                // Update indices only if this reply is more recent than what we know
                 uint64_t match = req.prev_log_index() + req.entries_size();
                 if (match > this->match_index_[peer_id]) {
                     this->match_index_[peer_id] = match;
@@ -240,7 +238,7 @@ void Raft::send_heartbeats() {
                     this->update_commit_index();
                 }
             } else {
-                // FAILURE: Log mismatch. Decrement and retry.
+                // Log mismatch. Decrement and retry.
                 // Only decrement if this reply matches our current expectation for this peer.
                 if (this->next_index_[peer_id] == req.prev_log_index() + 1) {
                     if (this->next_index_[peer_id] > 1) {
@@ -274,7 +272,7 @@ rafty::Raft::handle_append_entries(const raftpb::AppendEntriesRequest &req) {
         this->voted_for    = -1;
     }
 
-    // 3. Valid leader — step down and reset timer
+    // 3. Valid leader - step down and reset timer
     this->is_leader_ = false;
     this->election_deadline = std::chrono::steady_clock::now() +
         std::chrono::milliseconds(150 + (std::rand() % 150));
@@ -317,7 +315,6 @@ rafty::Raft::handle_append_entries(const raftpb::AppendEntriesRequest &req) {
         if (new_commit > this->commit_index_) {
             this->commit_index_ = new_commit;
             
-            // MINIMAL FIX: Apply immediately inside the lock to guarantee strict ordering.
             // No more `to_apply` vector gathering.
             while (this->last_applied_ < this->commit_index_) {
                 this->last_applied_++;
@@ -446,105 +443,6 @@ rafty::Raft::handle_request_vote(uint64_t term, uint64_t candidate_id,
     result.term = this->current_term;
     return result;
 }
-
-// rafty::Raft::AppendEntriesResult
-// rafty::Raft::handle_append_entries(const raftpb::AppendEntriesRequest &req) {
-
-//     std::vector<ApplyResult> to_apply;
-//     AppendEntriesResult result;
-//     result.success = false;
-
-//     {
-//         std::scoped_lock lock(this->mtx);
-//         result.term = this->current_term;
-
-//         // 1. Reject stale leader
-//         if (req.term() < this->current_term)
-//             return result;
-
-//         // 2. Update term if newer
-//         if (req.term() > this->current_term) {
-//             this->current_term = req.term();
-//             this->voted_for    = -1;
-//         }
-
-//         // 3. Valid leader — step down and reset timer
-//         this->is_leader_ = false;
-//         this->election_deadline = std::chrono::steady_clock::now() +
-//             std::chrono::milliseconds(150 + (std::rand() % 150));
-
-//         // 4. Consistency check
-//         uint64_t prev_log_index = req.prev_log_index();
-//         uint64_t prev_log_term  = req.prev_log_term();
-
-//         if (prev_log_index >= this->log_.size()) {
-//             result.term = this->current_term;
-//             return result;
-//         }
-//         if (this->log_[prev_log_index].term() != prev_log_term) {
-//             result.term = this->current_term;
-//             return result;
-//         }
-
-//         // 5. Append / overwrite entries
-//         uint64_t log_index = prev_log_index + 1;
-//         for (int i = 0; i < req.entries_size(); i++) {
-//             const auto& entry = req.entries(i);
-//             if (log_index < this->log_.size()) {
-//                 if (this->log_[log_index].term() != entry.term())
-//                     this->log_.resize(log_index); // truncate conflicting tail
-//                 else {
-//                     log_index++;
-//                     continue; // already have matching entry
-//                 }
-//             }
-//             this->log_.push_back(entry);
-//             log_index++;
-//         }
-
-//         // 6. Advance commit index
-//         if (req.leader_commit() > this->commit_index_) {
-//             uint64_t last_new = req.prev_log_index() + req.entries_size();
-//             uint64_t new_commit = std::min(req.leader_commit(), last_new);
-
-//             // MINIMAL FIX: Prevent rollback & immediately push to apply queue
-//             if (new_commit > this->commit_index_) {
-//                 this->commit_index_ = new_commit;
-                
-//                 while (this->last_applied_ < this->commit_index_) {
-//                     this->last_applied_++;
-//                     if (this->last_applied_ < this->log_.size()) {
-//                         ApplyResult ar;
-//                         ar.index = this->last_applied_;
-//                         ar.data  = this->log_[this->last_applied_].data();
-//                         to_apply.push_back(ar);
-//                     }
-//                 }
-//             }
-        
-
-//             // Collect — do NOT call apply() while holding lock
-//             // while (this->last_applied_ < this->commit_index_) {
-//             //     this->last_applied_++;
-//             //     if (this->last_applied_ < this->log_.size()) {
-//             //         ApplyResult ar;
-//             //         ar.index = this->last_applied_;
-//             //         ar.data  = this->log_[this->last_applied_].data();
-//             //         to_apply.push_back(ar);
-//             //     }
-//             // }
-//         }
-
-//         result.term    = this->current_term;
-//         result.success = true;
-//     } // lock released
-
-//     // Apply outside the lock — no deadlock risk
-//     for (auto& ar : to_apply)
-//         this->apply(ar);
-
-//     return result;
-// }
 
 ProposalResult Raft::propose(const std::string &data) {
     uint64_t new_index;
