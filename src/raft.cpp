@@ -69,9 +69,9 @@ void Raft::run() {
 
             if (should_heartbeat) this->send_heartbeats();
             if (should_elect)     this->start_election();
-            this->apply_committed_entries(); 
-            
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            this->apply_committed_entries();
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
     }).detach();
 }
@@ -110,50 +110,73 @@ void Raft::start_election() {
 
             if (!status.ok()) return;
 
-            std::scoped_lock lock(this->mtx);
-            if (res.term() > this->current_term) {
-                this->current_term = res.term();
-                this->voted_for = -1;
-                this->is_leader_ = false;
-                return;
+            bool became_leader = false;
+            {
+                std::scoped_lock lock(this->mtx);
+                if (res.term() > this->current_term) {
+                    this->current_term = res.term();
+                    this->voted_for = -1;
+                    this->is_leader_ = false;
+                    return;
+                }
+
+                if (this->current_term != term_at_election || this->is_leader_) return;
+
+                if (res.vote_granted()) {
+                    if (++(*votes_received) == majority) {
+                        this->is_leader_ = true;
+                        uint64_t last_idx = this->log_.size() - 1;
+                        for (auto const& [pid, _] : this->peers_) {
+                            this->next_index_[pid] = last_idx + 1;
+                            this->match_index_[pid] = 0;
+                        }
+                        this->next_heartbeat_deadline = std::chrono::steady_clock::now();
+                        became_leader = true;
+                    }
+                }
             }
 
-            if (this->current_term != term_at_election || this->is_leader_) return;
-
-            if (res.vote_granted()) {
-                if (++(*votes_received) == majority) {
-                    this->is_leader_ = true;
-                    uint64_t last_idx = this->log_.size() - 1;
-                    for (auto const& [pid, _] : this->peers_) {
-                        this->next_index_[pid] = last_idx + 1;
-                        this->match_index_[pid] = 0;
-                    }
-                    this->next_heartbeat_deadline = std::chrono::steady_clock::now();
-                }
+            if (became_leader) {
+                this->send_heartbeats();
             }
         }).detach();
     }
 }
 
 void Raft::send_heartbeats() {
-    std::scoped_lock lock(this->mtx);
-    if (!this->is_leader_) return;
-
-    for (const auto& [peer_id, stub] : this->peers_) {
+    struct PerPeer {
+        uint64_t peer_id;
         raftpb::AppendEntriesRequest req;
-        req.set_term(this->current_term);
-        req.set_leader_id(this->id);
-        req.set_leader_commit(this->commit_index_);
+    };
+    std::vector<PerPeer> to_send;
 
-        uint64_t next = this->next_index_[peer_id];
-        uint64_t prev = next - 1;
-        
-        req.set_prev_log_index(prev);
-        req.set_prev_log_term(this->log_[prev].term());
+    {
+        std::scoped_lock lock(this->mtx);
+        if (!this->is_leader_) return;
 
-        for (size_t i = next; i < this->log_.size(); ++i) {
-            *req.add_entries() = this->log_[i];
+        for (const auto& [peer_id, stub] : this->peers_) {
+            raftpb::AppendEntriesRequest req;
+            req.set_term(this->current_term);
+            req.set_leader_id(this->id);
+            req.set_leader_commit(this->commit_index_);
+
+            uint64_t next = this->next_index_[peer_id];
+            if (next == 0) next = 1;  // safety: prev must be >= 0
+            uint64_t prev = next - 1;
+
+            req.set_prev_log_index(prev);
+            req.set_prev_log_term(this->log_[prev].term());
+
+            for (size_t i = next; i < this->log_.size(); ++i) {
+                *req.add_entries() = this->log_[i];
+            }
+            to_send.push_back({peer_id, std::move(req)});
         }
+    }
+
+    for (auto &item : to_send) {
+        uint64_t peer_id = item.peer_id;
+        raftpb::AppendEntriesRequest req = std::move(item.req);
 
         std::thread([this, peer_id, req]() {
             auto context = this->create_context(peer_id);
@@ -162,25 +185,36 @@ void Raft::send_heartbeats() {
 
             if (!status.ok()) return;
 
-            std::scoped_lock lock(this->mtx);
-            if (res.term() > this->current_term) {
-                this->current_term = res.term();
-                this->is_leader_ = false;
-                this->voted_for = -1;
-                return;
+            bool should_apply = false;
+            {
+                std::scoped_lock lock(this->mtx);
+                if (res.term() > this->current_term) {
+                    this->current_term = res.term();
+                    this->is_leader_ = false;
+                    this->voted_for = -1;
+                    return;
+                }
+
+                if (!this->is_leader_ || req.term() != this->current_term) return;
+
+                if (res.success()) {
+                    uint64_t match = req.prev_log_index() + req.entries_size();
+                    this->match_index_[peer_id] = std::max(this->match_index_[peer_id], match);
+                    this->next_index_[peer_id] = this->match_index_[peer_id] + 1;
+                    uint64_t prev_commit = this->commit_index_;
+                    this->update_commit_index();
+                    if (this->commit_index_ > prev_commit) {
+                        should_apply = true;
+                    }
+                } else {
+                    if (this->next_index_[peer_id] > 1) {
+                        this->next_index_[peer_id]--;
+                    }
+                }
             }
 
-            if (!this->is_leader_ || req.term() != this->current_term) return;
-
-            if (res.success()) {
-                uint64_t match = req.prev_log_index() + req.entries_size();
-                this->match_index_[peer_id] = std::max(this->match_index_[peer_id], match);
-                this->next_index_[peer_id] = this->match_index_[peer_id] + 1;
-                this->update_commit_index();
-            } else {
-                if (this->next_index_[peer_id] > 1) {
-                    this->next_index_[peer_id]--;
-                }
+            if (should_apply) {
+                this->apply_committed_entries();
             }
         }).detach();
     }
@@ -188,43 +222,48 @@ void Raft::send_heartbeats() {
 
 rafty::Raft::AppendEntriesResult Raft::handle_append_entries(const raftpb::AppendEntriesRequest &req) {
     AppendEntriesResult res;
-    std::scoped_lock lock(this->mtx);
-    res.term = this->current_term;
-    res.success = false;
-
-    if (req.term() < this->current_term) return res;
-
-    if (req.term() > this->current_term) {
-        this->current_term = req.term();
-        this->voted_for = -1;
-    }
-    this->is_leader_ = false;
-    this->election_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(150 + (std::rand() % 150));
-
-    if (req.prev_log_index() >= this->log_.size() || this->log_[req.prev_log_index()].term() != req.prev_log_term()) {
+    {
+        std::scoped_lock lock(this->mtx);
         res.term = this->current_term;
-        return res;
-    }
+        res.success = false;
 
-    uint64_t idx = req.prev_log_index() + 1;
-    for (int i = 0; i < req.entries_size(); i++) {
-        if (idx < this->log_.size()) {
-            if (this->log_[idx].term() != req.entries(i).term()) {
-                this->log_.resize(idx);
+        if (req.term() < this->current_term) return res;
+
+        if (req.term() > this->current_term) {
+            this->current_term = req.term();
+            this->voted_for = -1;
+        }
+        this->is_leader_ = false;
+        this->election_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(150 + (std::rand() % 150));
+
+        if (req.prev_log_index() >= this->log_.size() ||
+            this->log_[req.prev_log_index()].term() != req.prev_log_term()) {
+            res.term = this->current_term;
+            return res;
+        }
+
+        uint64_t idx = req.prev_log_index() + 1;
+        for (int i = 0; i < req.entries_size(); i++) {
+            if (idx < this->log_.size()) {
+                if (this->log_[idx].term() != req.entries(i).term()) {
+                    this->log_.resize(idx);
+                    this->log_.push_back(req.entries(i));
+                }
+            } else {
                 this->log_.push_back(req.entries(i));
             }
-        } else {
-            this->log_.push_back(req.entries(i));
+            idx++;
         }
-        idx++;
+
+        if (req.leader_commit() > this->commit_index_) {
+            this->commit_index_ = std::min(req.leader_commit(), (uint64_t)this->log_.size() - 1);
+        }
+
+        res.success = true;
+        res.term = this->current_term;
     }
 
-    if (req.leader_commit() > this->commit_index_) {
-        this->commit_index_ = std::min(req.leader_commit(), (uint64_t)this->log_.size() - 1);
-    }
-
-    res.success = true;
-    res.term = this->current_term;
+    this->apply_committed_entries();
     return res;
 }
 
@@ -255,7 +294,7 @@ void Raft::apply_committed_entries() {
                 ApplyResult ar;
                 ar.index = next;
                 ar.data = this->log_[next].data();
-                ar.valid = true; // Set this based on your common.hpp
+                ar.valid = true;
                 to_apply.push_back(ar);
                 this->last_applied_ = next;
             } else break;
@@ -283,8 +322,9 @@ rafty::Raft::RequestVoteResult Raft::handle_request_vote(uint64_t term, uint64_t
     if (this->voted_for == -1 || this->voted_for == (int64_t)candidate_id) {
         uint64_t my_last_idx = this->log_.size() - 1;
         uint64_t my_last_term = this->log_[my_last_idx].term();
-        bool up_to_date = (last_log_term > my_last_term) || (last_log_term == my_last_term && last_log_index >= my_last_idx);
-        
+        bool up_to_date = (last_log_term > my_last_term) ||
+                          (last_log_term == my_last_term && last_log_index >= my_last_idx);
+
         if (up_to_date) {
             this->voted_for = candidate_id;
             res.vote_granted = true;
@@ -296,49 +336,54 @@ rafty::Raft::RequestVoteResult Raft::handle_request_vote(uint64_t term, uint64_t
 }
 
 ProposalResult Raft::propose(const std::string &data) {
-    std::scoped_lock lock(this->mtx);
-    if (!this->is_leader_) {
-        return ProposalResult{0, this->current_term, false};
+    uint64_t new_idx;
+    uint64_t term;
+    {
+        std::scoped_lock lock(this->mtx);
+        if (!this->is_leader_) {
+            return ProposalResult{0, this->current_term, false};
+        }
+
+        new_idx = this->log_.size();
+        term = this->current_term;
+
+        raftpb::Entry entry;
+        entry.set_term(term);
+        entry.set_index(new_idx);
+        entry.set_data(data);
+        this->log_.push_back(entry);
+
+        this->next_heartbeat_deadline =
+            std::chrono::steady_clock::now() + std::chrono::milliseconds(50);
     }
 
-    uint64_t new_idx = this->log_.size();
-    raftpb::Entry entry;
-    entry.set_term(this->current_term);
-    entry.set_index(new_idx);
-    entry.set_data(data);
-    this->log_.push_back(entry);
+    this->send_heartbeats();
 
-    this->next_heartbeat_deadline = std::chrono::steady_clock::now();
-    return ProposalResult{new_idx, this->current_term, true};
+    return ProposalResult{new_idx, term, true};
 }
 
 ProposalResult Raft::propose_sync(const std::string &data) {
-    // 1. Propose the data
     ProposalResult res = this->propose(data);
-    
-    // 2. If we aren't the leader (is_leader is false), return immediately
+
     if (!res.is_leader) {
         return res;
     }
 
-    // 3. Wait until the entry is committed or we lose leadership
     const int timeout_ms = 2000;
     auto start = std::chrono::steady_clock::now();
-    
+
     while (!this->is_dead()) {
         {
             std::scoped_lock lock(this->mtx);
-            // Check if committed
             if (this->commit_index_ >= res.index) {
                 if (this->log_[res.index].term() == res.term) {
-                    return res; // Success
+                    return res;
                 } else {
-                    res.is_leader = false; 
+                    res.is_leader = false;
                     return res;
                 }
             }
-            
-            // If we lost leadership or term changed while waiting
+
             if (!this->is_leader_ || this->current_term != res.term) {
                 res.is_leader = false;
                 return res;
@@ -351,7 +396,7 @@ ProposalResult Raft::propose_sync(const std::string &data) {
             return res;
         }
 
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 
     res.is_leader = false;
