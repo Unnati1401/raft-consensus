@@ -44,6 +44,7 @@ public:
   void on_apply(const rafty::ApplyResult &result) {
     if (!result.valid) return;
 
+    // Parse OUTSIDE the lock — string ops are expensive
     std::string op, key, value;
     uint64_t client_id = 0, seq_num = 0;
 
@@ -66,41 +67,53 @@ public:
         if (pos < d.size()) value = d.substr(pos);
     }
 
-    std::unique_lock<std::mutex> lock(mtx_);
-
     kvpb::KvStatus op_status = kvpb::KV_SUCCESS;
     std::string    op_value;
+    std::shared_ptr<PendingOp> pending;
 
-    auto &rifl = rifl_table_[client_id];
-    bool is_dup = (seq_num != 0 && seq_num <= rifl.seq_num);
+    {
+        // Lock held for minimal time — only state mutations
+        std::unique_lock<std::mutex> lock(mtx_);
 
-    if (is_dup) {
-        op_status = rifl.status;
-        op_value  = rifl.value;
-    } else {
-        if (op == OP_PUT) {
-            store_[key] = value;
-        } else if (op == OP_APPEND) {
-            store_[key] += value;
-        } else if (op == OP_GET) {
-            auto it = store_.find(key);
-            op_value = (it != store_.end()) ? it->second : "";
+        auto &rifl = rifl_table_[client_id];
+        bool is_dup = (seq_num != 0 && seq_num <= rifl.seq_num);
+
+        if (is_dup) {
+            op_status = rifl.status;
+            op_value  = rifl.value;
+        } else {
+            if (op == OP_PUT) {
+                store_[key] = value;
+            } else if (op == OP_APPEND) {
+                store_[key] += value;
+            } else if (op == OP_GET) {
+                auto it = store_.find(key);
+                op_value = (it != store_.end()) ? it->second : "";
+            }
+            rifl.seq_num = seq_num;
+            rifl.status  = op_status;
+            rifl.value   = op_value;
         }
-        // Update RIFL cache
-        rifl.seq_num = seq_num;
-        rifl.status  = op_status;
-        rifl.value   = op_value;
-    }
 
-    auto it = pending_ops_.find(result.index);
-    if (it != pending_ops_.end()) {
-        auto &p       = *it->second;
-        p.done        = true;
-        p.wrong_leader = false;
-        p.status      = op_status;
-        p.value       = op_value;
-        p.cv.notify_all();
+        last_applied_index_ = result.index;
+
+        // Grab the pending op pointer while under lock, notify outside
+        auto it = pending_ops_.find(result.index);
+        if (it != pending_ops_.end()) {
+            pending = it->second;
+            pending->done         = true;
+            pending->wrong_leader = false;
+            pending->status       = op_status;
+            pending->value        = op_value;
+        }
+    } // Lock released here
+
+    // Notify OUTSIDE the lock — avoids waking threads that immediately
+    // block again trying to re-acquire mtx_
+    if (pending) {
+        pending->cv.notify_all();
     }
+    apply_cv_.notify_all();
   }
 
 private:
@@ -125,6 +138,56 @@ private:
       kvpb::KvStatus status;
       std::string    value;
   };
+
+  // Fast local read: wait until last_applied_index_ >= read_index, then
+  // serve directly from store_. No Raft log entry needed.
+  OpResult execute_get(const std::string &key,
+                       uint64_t           client_id,
+                       uint64_t           seq_num) {
+    // Check RIFL cache first
+    {
+        std::unique_lock<std::mutex> lock(mtx_);
+        auto it = rifl_table_.find(client_id);
+        if (it != rifl_table_.end() &&
+            seq_num != 0 &&
+            seq_num <= it->second.seq_num) {
+            return {it->second.status, it->second.value};
+        }
+    }
+
+    // Get the read index from Raft (current commit index on leader)
+    // This confirms we are leader and tells us how far we need to be applied
+    uint64_t read_index = raft_.get_read_index();
+    if (read_index == 0) {
+        return {kvpb::KV_NOTLEADER, ""};
+    }
+
+    // Wait until our apply thread has caught up to read_index
+    {
+        std::unique_lock<std::mutex> lock(mtx_);
+        bool ok = apply_cv_.wait_for(
+            lock,
+            std::chrono::milliseconds(KV_TIMEOUT_MS),
+            [&]{ return last_applied_index_ >= read_index; }
+        );
+        if (!ok) {
+            auto state = raft_.get_state();
+            return {state.is_leader ? kvpb::KV_TIMEOUT : kvpb::KV_NOTLEADER, ""};
+        }
+
+        // Serve locally — no log entry written
+        auto it = store_.find(key);
+        std::string val = (it != store_.end()) ? it->second : "";
+
+        // Update RIFL cache for this Get
+        auto &rifl = rifl_table_[client_id];
+        rifl.seq_num = seq_num;
+        rifl.status  = kvpb::KV_SUCCESS;
+        rifl.value   = val;
+
+        return {kvpb::KV_SUCCESS, val};
+    }
+  }
 
   OpResult execute_op(const char       *op_tag,
                       const std::string &key,
@@ -207,11 +270,10 @@ public:
   grpc::Status Get(grpc::ServerContext *,
                    const kvpb::GetRequest *request,
                    kvpb::GetResponse *response) override {
-    auto res = execute_op(OP_GET,
-                          request->key(),
-                          "",
-                          request->client_id(),
-                          request->seq_num());
+    // Fast path: no Raft log entry for reads
+    auto res = execute_get(request->key(),
+                           request->client_id(),
+                           request->seq_num());
     response->set_status(res.status);
     response->set_value(res.value);
     return grpc::Status::OK;
@@ -235,10 +297,12 @@ private:
   std::mutex mtx_;  
 
   std::unordered_map<std::string, std::string> store_;
-
   std::unordered_map<uint64_t, RiflEntry> rifl_table_;
-
   std::unordered_map<uint64_t, std::shared_ptr<PendingOp>> pending_ops_;
+
+  // For read-index Gets
+  uint64_t last_applied_index_ = 0;
+  std::condition_variable apply_cv_;
 };
 
 } // namespace kv

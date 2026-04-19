@@ -61,6 +61,7 @@ public:
   void connect_peers();
   bool is_dead() const;
   void kill();
+  uint64_t get_read_index() const;
 
 private:
   // WARN: do not modify `create_context` and `apply`.
@@ -113,6 +114,9 @@ private:
   int64_t voted_for = -1;
   // whether this node currently considers itself leader
   bool is_leader_ = false;
+
+  std::condition_variable cv_;
+  bool needs_work_ = false;
 };
 } // namespace rafty
 

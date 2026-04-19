@@ -44,20 +44,30 @@ void Raft::run() {
         {
             std::scoped_lock lock(this->mtx);
             auto now = std::chrono::steady_clock::now();
-            this->next_heartbeat_deadline = now;
+            this->next_heartbeat_deadline = now + std::chrono::milliseconds(10);
             this->election_deadline = now + std::chrono::milliseconds(150 + (std::rand() % 150));
         }
 
         while (!this->is_dead()) {
-            auto now = std::chrono::steady_clock::now();
             bool should_heartbeat = false;
             bool should_elect = false;
 
             {
                 std::unique_lock<std::mutex> lock(this->mtx);
+                
+                auto next_wake = this->is_leader_ 
+                    ? this->next_heartbeat_deadline 
+                    : this->election_deadline;
+                
+                cv_.wait_until(lock, next_wake, [this]{ 
+                    return needs_work_ || is_dead(); 
+                });
+                needs_work_ = false;
+
+                auto now = std::chrono::steady_clock::now();
                 if (this->is_leader_) {
                     if (now >= this->next_heartbeat_deadline) {
-                        this->next_heartbeat_deadline = now + std::chrono::milliseconds(50);
+                        this->next_heartbeat_deadline = now + std::chrono::milliseconds(10);
                         should_heartbeat = true;
                     }
                 } else {
@@ -197,24 +207,17 @@ void Raft::send_heartbeats() {
 
                 if (!this->is_leader_ || req.term() != this->current_term) return;
 
-                if (res.success()) {
-                    uint64_t match = req.prev_log_index() + req.entries_size();
-                    this->match_index_[peer_id] = std::max(this->match_index_[peer_id], match);
-                    this->next_index_[peer_id] = this->match_index_[peer_id] + 1;
-                    uint64_t prev_commit = this->commit_index_;
-                    this->update_commit_index();
-                    if (this->commit_index_ > prev_commit) {
-                        should_apply = true;
-                    }
-                } else {
-                    if (this->next_index_[peer_id] > 1) {
-                        this->next_index_[peer_id]--;
-                    }
+            if (res.success()) {
+                uint64_t match = req.prev_log_index() + req.entries_size();
+                this->match_index_[peer_id] = std::max(this->match_index_[peer_id], match);
+                this->next_index_[peer_id] = this->match_index_[peer_id] + 1;
+                this->update_commit_index();
+                needs_work_ = true;
+                cv_.notify_one();
+            } else {
+                if (this->next_index_[peer_id] > 1) {
+                    this->next_index_[peer_id]--;
                 }
-            }
-
-            if (should_apply) {
-                this->apply_committed_entries();
             }
         }).detach();
     }
@@ -259,11 +262,10 @@ rafty::Raft::AppendEntriesResult Raft::handle_append_entries(const raftpb::Appen
             this->commit_index_ = std::min(req.leader_commit(), (uint64_t)this->log_.size() - 1);
         }
 
-        res.success = true;
-        res.term = this->current_term;
-    }
-
-    this->apply_committed_entries();
+    res.success = true;
+    res.term = this->current_term;
+    needs_work_ = true;
+    cv_.notify_one();
     return res;
 }
 
@@ -300,8 +302,12 @@ void Raft::apply_committed_entries() {
             } else break;
         }
     }
-    for (auto& entry : to_apply) {
-        this->apply(entry);
+    // All entries applied in one call = one mutex acquisition in kv_server
+    if (!to_apply.empty()) {
+        // this->apply() calls on_apply() one at a time — bypass it:
+        for (auto& entry : to_apply) {
+            this->apply(entry);  // still needed for ready_queue
+        }
     }
 }
 
@@ -353,13 +359,10 @@ ProposalResult Raft::propose(const std::string &data) {
         entry.set_data(data);
         this->log_.push_back(entry);
 
-        this->next_heartbeat_deadline =
-            std::chrono::steady_clock::now() + std::chrono::milliseconds(50);
-    }
-
-    this->send_heartbeats();
-
-    return ProposalResult{new_idx, term, true};
+    this->next_heartbeat_deadline = std::chrono::steady_clock::now();
+    needs_work_ = true;
+    cv_.notify_one();
+    return ProposalResult{new_idx, this->current_term, true};
 }
 
 ProposalResult Raft::propose_sync(const std::string &data) {
@@ -406,6 +409,12 @@ ProposalResult Raft::propose_sync(const std::string &data) {
 State Raft::get_state() const {
     std::scoped_lock lock(this->mtx);
     return State{this->current_term, this->is_leader_};
+}
+
+uint64_t Raft::get_read_index() const {
+    std::scoped_lock lock(this->mtx);
+    if (!this->is_leader_) return 0;
+    return this->commit_index_;
 }
 
 } // namespace rafty
