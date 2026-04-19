@@ -219,6 +219,7 @@ void Raft::send_heartbeats() {
                     this->next_index_[peer_id]--;
                 }
             }
+        }
         }).detach();
     }
 }
@@ -267,6 +268,7 @@ rafty::Raft::AppendEntriesResult Raft::handle_append_entries(const raftpb::Appen
     needs_work_ = true;
     cv_.notify_one();
     return res;
+}
 }
 
 void Raft::update_commit_index() {
@@ -363,6 +365,7 @@ ProposalResult Raft::propose(const std::string &data) {
     needs_work_ = true;
     cv_.notify_one();
     return ProposalResult{new_idx, this->current_term, true};
+}
 }
 
 ProposalResult Raft::propose_sync(const std::string &data) {
