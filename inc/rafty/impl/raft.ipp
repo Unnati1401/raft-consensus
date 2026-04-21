@@ -30,7 +30,7 @@ inline void Raft::start_server() {
   // TODO: implement RaftService RPC
   // and register the service.
   this->service_impl_ = std::make_unique<rafty::RaftServiceImpl>(this);
-  builder.RegisterService(this->service_impl_.get());/* replaced nullptr with actual gRPC service */
+  builder.RegisterService(this->service_impl_.get());
 
   std::unique_ptr<Server> server(builder.BuildAndStart());
   logger->info("Raft server {} listening on {}", id, listening_addr);
@@ -48,13 +48,9 @@ inline void Raft::stop_server() {
 
 inline void Raft::connect_peers() {
   grpc::ChannelArguments args;
-  // Set the maximum backoff time for reconnection attempts (e.g., 200ms)
-  args.SetInt(GRPC_ARG_MAX_RECONNECT_BACKOFF_MS, 200); // 1 second max backoff
-  // Set the minimum backoff time for reconnection attempts (e.g., 50ms)
-  args.SetInt(GRPC_ARG_MIN_RECONNECT_BACKOFF_MS, 50); // 100ms min backoff
-  // Set the initial backoff time for reconnection attempts (e.g., 50ms)
-  args.SetInt(GRPC_ARG_INITIAL_RECONNECT_BACKOFF_MS,
-              50); // 100ms initial backoff
+  args.SetInt(GRPC_ARG_MAX_RECONNECT_BACKOFF_MS, 200);
+  args.SetInt(GRPC_ARG_MIN_RECONNECT_BACKOFF_MS, 50);
+  args.SetInt(GRPC_ARG_INITIAL_RECONNECT_BACKOFF_MS, 50);
 
   for (const auto &peer_addr : peer_addrs) {
     logger->info("Connecting to peer {} at {}", peer_addr.first,
@@ -79,7 +75,15 @@ inline bool Raft::is_dead() const { return this->dead.load(); }
 
 inline void Raft::kill() {
   this->dead.store(true);
-  // add your code here if needed.
+  // Wake all worker threads so they observe is_dead() and exit cleanly.
+  {
+    std::scoped_lock lock(this->mtx);
+    cv_.notify_all();
+    apply_cv_.notify_all();
+    for (auto &[pid, ps] : this->peer_sync_) {
+      ps->cv.notify_all();
+    }
+  }
 }
 
 inline std::unique_ptr<grpc::ClientContext>

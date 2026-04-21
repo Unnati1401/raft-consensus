@@ -6,6 +6,11 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <condition_variable>
+#include <thread>
+#include <vector>
+#include <atomic>
+#include <chrono>
 
 #include <grpcpp/grpcpp.h>
 
@@ -23,6 +28,12 @@ namespace rafty {
 using RaftServiceStub = std::unique_ptr<raftpb::RaftService::Stub>;
 using grpc::Server;
 
+// Per-peer state used by the dedicated replicator thread.
+struct PeerSync {
+  std::condition_variable cv;
+  std::chrono::steady_clock::time_point next_heartbeat;
+};
+
 class Raft {
 public:
   Raft(const Config &config, MessageQueue<ApplyResult> &ready);
@@ -33,7 +44,7 @@ public:
   void run(); /* lab 1 */
   ProposalResult propose(const std::string &data); /* lab 1 */
   State get_state() const; /* lab 2 */
-  // RPC result helpers and handlers (declared for definition in src/raft.cpp)
+
   struct RequestVoteResult {
     uint64_t term;
     bool vote_granted;
@@ -44,15 +55,21 @@ public:
     bool success;
   };
 
+  struct PeerSync {
+    std::condition_variable cv;
+    std::chrono::steady_clock::time_point next_heartbeat;
+    std::atomic<bool> has_work{false}; // Add this line
+};
+
   RequestVoteResult handle_request_vote(uint64_t term,
                                         uint64_t candidate_id,
                                         uint64_t last_log_index,
                                         uint64_t last_log_term);
 
   AppendEntriesResult handle_append_entries(const raftpb::AppendEntriesRequest &req);
-  void send_heartbeats();
+
+  void send_heartbeats();    // legacy, kept for compatibility
   void send_request_votes();
-  // lab3: sync propose
   ProposalResult propose_sync(const std::string &data);
 
   // WARN: do not modify the signature
@@ -61,13 +78,11 @@ public:
   void connect_peers();
   bool is_dead() const;
   void kill();
+
   uint64_t get_read_index() const;
 
 private:
   // WARN: do not modify `create_context` and `apply`.
-
-  // invoke `create_context` when creating context for rpc call.
-  // args: the id of which raft instance the RPC will go to.
   std::unique_ptr<grpc::ClientContext> create_context(uint64_t to) const;
   void apply(const ApplyResult &result);
 
@@ -78,21 +93,24 @@ protected:
 
   // Log storage
   std::vector<raftpb::Entry> log_;
-  
+
   // Volatile state on all servers
   uint64_t commit_index_;
   uint64_t last_applied_;
-  
+
   // Volatile state on leaders
   std::unordered_map<uint64_t, uint64_t> next_index_;
   std::unordered_map<uint64_t, uint64_t> match_index_;
-  
-  void apply_committed_entries();
+
   void update_commit_index();
   std::chrono::steady_clock::time_point next_heartbeat_deadline;
   std::chrono::steady_clock::time_point election_deadline;
   void start_election();
-  
+
+  // Persistent worker loops (NEW)
+  void replicator_loop(uint64_t peer_id);
+  void apply_loop();
+
 private:
   // WARN: do not modify the declaration of
   // `id`, `listening_addr`, `peer_addrs`,
@@ -115,9 +133,21 @@ private:
   // whether this node currently considers itself leader
   bool is_leader_ = false;
 
+  // Election-loop CV (used by main run() thread)
   std::condition_variable cv_;
   bool needs_work_ = false;
+
+  // NEW: per-peer replicator state (signals + bookkeeping)
+  std::unordered_map<uint64_t, std::unique_ptr<PeerSync>> peer_sync_;
+
+  // NEW: apply thread CV — signaled when commit_index_ advances
+  std::condition_variable apply_cv_;
+  
+  static constexpr int HEARTBEAT_MS = 30;
+  // Store nanoseconds since epoch as a plain 64-bit integer
+  std::atomic<int64_t> lease_deadline_ns{0};
 };
+
 } // namespace rafty
 
 #include "rafty/impl/raft.ipp" // IWYU pragma: keep
