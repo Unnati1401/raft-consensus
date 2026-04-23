@@ -42,6 +42,11 @@ struct PendingOp {
     bool done = false;
 };
 
+struct CompletedOp {
+    kvpb::KvStatus status = kvpb::KV_NOTLEADER;
+    std::string value;
+};
+
 class KvServer final : public kvpb::KvService::Service {
 public:
     explicit KvServer(rafty::Raft &raft) : raft_(raft) {}
@@ -92,6 +97,14 @@ public:
         {
             std::scoped_lock lock(pending_mtx_);
             pending_ops_[res.index] = pending;
+            auto done_it = completed_ops_.find(res.index);
+            if (done_it != completed_ops_.end()) {
+                std::scoped_lock pending_lock(pending->m);
+                pending->status = done_it->second.status;
+                pending->value = done_it->second.value;
+                pending->done = true;
+                completed_ops_.erase(done_it);
+            }
         }
 
         std::unique_lock<std::mutex> wait_lock(pending->m);
@@ -165,7 +178,16 @@ public:
         {
             std::scoped_lock lock(pending_mtx_);
             auto it = pending_ops_.find(result.index);
-            if (it != pending_ops_.end()) pending = it->second;
+            if (it != pending_ops_.end()) {
+                pending = it->second;
+            } else if (raft_.get_state().is_leader) {
+                // Fast-commit race: apply can happen before execute_op registers
+                // pending_ops_[index]. Cache it briefly so the RPC can complete.
+                completed_ops_[result.index] = CompletedOp{op_status, op_value};
+                if (completed_ops_.size() > kMaxCompletedOps) {
+                    completed_ops_.clear();
+                }
+            }
         }
 
         if (pending) {
@@ -186,6 +208,8 @@ private:
     std::array<Shard, NUM_SHARDS> shards_;
     std::mutex pending_mtx_;
     std::unordered_map<uint64_t, std::shared_ptr<PendingOp>> pending_ops_;
+    std::unordered_map<uint64_t, CompletedOp> completed_ops_;
+    static constexpr size_t kMaxCompletedOps = 4096;
 };
 
 } // namespace kv

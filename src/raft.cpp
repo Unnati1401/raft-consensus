@@ -4,13 +4,19 @@
 #include "common/utils/tracing.hpp"
 #endif
 
+namespace {
+// Replicator-only timing (does not rely on Raft::HEARTBEAT_MS in raft.hpp).
+// Keep heartbeats frequent enough for read lease freshness, but not so frequent
+// that background AppendEntries traffic starves foreground proposal/commit work.
+constexpr int kAppendEntriesPeriodMs = 50;
+constexpr int kLeaderReadLeaseMs = 40;
+} // namespace
+
 namespace rafty {
 using grpc::ServerBuilder;
 using grpc::ServerContext;
 using grpc::experimental::ClientInterceptorFactoryInterface;
 using grpc::experimental::CreateCustomChannelWithInterceptors;
-
-static constexpr int HEARTBEAT_MS = 50;
 
 // Constructor
 Raft::Raft(const Config &config, MessageQueue<ApplyResult> &ready)
@@ -104,20 +110,12 @@ void Raft::replicator_loop(uint64_t peer_id) {
             
             // If we lost leadership while sleeping, reset heartbeat and wait again
             if (!this->is_leader_) {
-                ps.next_heartbeat = std::chrono::steady_clock::now() + std::chrono::milliseconds(HEARTBEAT_MS);
+                ps.next_heartbeat = std::chrono::steady_clock::now() +
+                    std::chrono::milliseconds(kAppendEntriesPeriodMs);
                 continue;
             }
 
-            if (this->next_index_[peer_id] < this->log_.size()) {
-                lock.unlock();
-                std::this_thread::sleep_for(std::chrono::microseconds(200)); 
-                lock.lock();
-                
-                // Re-verify state after yielding
-                if (this->is_dead() || !this->is_leader_) continue;
-            }
-
-            // 2. Build the Batch Request
+            // 2. Build the Batch Request (batching is capped at 1000 entries per RPC)
             req.set_term(this->current_term);
             req.set_leader_id(this->id);
             req.set_leader_commit(this->commit_index_);
@@ -139,7 +137,8 @@ void Raft::replicator_loop(uint64_t peer_id) {
                 if (req.entries_size() >= 1000) break; 
             }
 
-            ps.next_heartbeat = std::chrono::steady_clock::now() + std::chrono::milliseconds(HEARTBEAT_MS);
+            ps.next_heartbeat = std::chrono::steady_clock::now() +
+                std::chrono::milliseconds(kAppendEntriesPeriodMs);
             send_now = true;
         }
 
@@ -179,9 +178,9 @@ void Raft::replicator_loop(uint64_t peer_id) {
                 this->match_index_[peer_id] = std::max(this->match_index_[peer_id], match);
                 this->next_index_[peer_id] = this->match_index_[peer_id] + 1;
 
-                // Contacting any peer successfully is progress toward a lease.
-                // Leader Lease = Heartbeat interval - slack (10ms)
-                auto new_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(HEARTBEAT_MS - 10);
+                // Successful AppendEntries extends the leader lease for local reads.
+                auto new_deadline = std::chrono::steady_clock::now() +
+                    std::chrono::milliseconds(kLeaderReadLeaseMs);
                 this->lease_deadline_ns.store(new_deadline.time_since_epoch().count());
 
                 uint64_t prev_commit = this->commit_index_;
@@ -446,12 +445,13 @@ ProposalResult Raft::propose_sync(const std::string &data) {
   if (!res.is_leader) return res;
 
   const int timeout_ms = 2000;
-  auto start = std::chrono::steady_clock::now();
+  auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
 
   while (!this->is_dead()) {
     {
       std::unique_lock<std::mutex> lock(this->mtx);
-      apply_cv_.wait_for(lock, std::chrono::milliseconds(5), [&] {
+      apply_cv_.wait_until(lock, deadline, [&] {
         return this->commit_index_ >= res.index ||
                !this->is_leader_ ||
                this->current_term != res.term ||
@@ -468,9 +468,7 @@ ProposalResult Raft::propose_sync(const std::string &data) {
         return res;
       }
     }
-    auto now = std::chrono::steady_clock::now();
-    if (std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count() >
-        timeout_ms) {
+    if (std::chrono::steady_clock::now() >= deadline) {
       res.is_leader = false;
       return res;
     }
